@@ -26,6 +26,7 @@ import sys
 import textwrap
 import types
 import typing
+import unicodedata
 from collections.abc import AsyncIterator
 from typing import (
     TYPE_CHECKING,
@@ -451,6 +452,30 @@ _SAFE_EXPR_MAX_INT_BITS = 4096  # width of any int produced by arithmetic (or wr
 _SAFE_EXPR_MAX_SEQ_REPEAT = 10_000  # n in ``sequence * n``
 _SAFE_EXPR_MAX_SEQ_LEN = 1_000_000  # logical size of a sequence built by *, + or a display
 
+# Digits of 2**4096 in a given base, built by repeated divmod (never by
+# str(int)), so sys.set_int_max_str_digits() cannot affect the budget check.
+_SAFE_EXPR_INT_THRESHOLDS: typing.Dict[int, str] = {}
+_SAFE_EXPR_INT_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+# Above this length, an input we cannot classify is rejected without converting.
+_SAFE_EXPR_INT_MAX_PARSE_CHARS = 10_000
+
+
+def _int_width_threshold(base: int) -> str:
+    """Cached digits of 2**_SAFE_EXPR_MAX_INT_BITS, generated independently of
+    CPython's int<->str digit limit and without changing any global setting."""
+    cached = _SAFE_EXPR_INT_THRESHOLDS.get(base)
+    if cached is not None:
+        return cached
+    value = 1 << _SAFE_EXPR_MAX_INT_BITS
+    digits = []
+    while value:
+        value, digit = divmod(value, base)
+        digits.append(_SAFE_EXPR_INT_ALPHABET[digit])
+    result = "".join(reversed(digits))
+    _SAFE_EXPR_INT_THRESHOLDS[base] = result
+    return result
+
+
 # Operand types accepted by ``+``, ``-``, ``*``, ``%`` and ``**`` (the operators
 # whose result can grow). Integers are anything with ``__index__``, coerced to
 # plain ``int``; floats are ``float`` and its subclasses; sequences are exactly
@@ -700,6 +725,80 @@ class _SafeExprInterpreter:
             self._check_size(self._logical_size(value))
 
     @staticmethod
+    def _check_int_result(value: typing.Any) -> typing.Any:
+        """Width backstop for values produced by arithmetic, unary operators
+        and allowlisted builtin calls here. Values returned by attribute
+        access, subscripts or custom objects are not measured."""
+        if isinstance(value, int) and value.bit_length() > _SAFE_EXPR_MAX_INT_BITS:
+            raise ValueError(f"safe_expr: integer result wider than {_SAFE_EXPR_MAX_INT_BITS} bits")
+        return value
+
+    @staticmethod
+    def _int_precheck(value: typing.Any, base: int) -> None:
+        """Reject an int() string argument that *cannot* fit the width budget
+        before CPython performs a potentially quadratic conversion.
+
+        The effective base is inferred exactly as Python does for base=0.
+        Digits are normalized to their *numeric value* (Unicode decimal digits
+        included), never compared by code point. Inputs Python would reject are
+        left to int(); very long inputs that cannot be classified are rejected
+        conservatively so a disabled CPython digit guard cannot make them slow.
+        """
+        if isinstance(value, bytes):
+            try:
+                text = value.strip(b" \t\n\r\v\f").decode("ascii")
+            except UnicodeDecodeError:
+                return
+        else:
+            text = value.strip()
+        if text[:1] in ("+", "-"):
+            text = text[1:]
+        effective = base
+        if base == 0:
+            prefix = text[:2].lower()
+            effective = 16 if prefix == "0x" else 8 if prefix == "0o" else 2 if prefix == "0b" else 10
+        if effective != 10 and text[:2].lower() in ("0x", "0o", "0b"):
+            text = text[2:]
+        # Underscore placement is left to Python. Map each remaining character
+        # to its numeric value so Unicode decimal digits compare by value, not
+        # by code point. An unmappable character means the literal is invalid.
+        digits = []
+        for ch in text:
+            if ch == "_":
+                if len(text) > _SAFE_EXPR_INT_MAX_PARSE_CHARS:
+                    raise ValueError(
+                        f"safe_expr: int() string too long for a "
+                        f"{_SAFE_EXPR_MAX_INT_BITS}-bit result"
+                    )
+                return
+            if effective == 10:
+                digit = unicodedata.decimal(ch, None)  # None for non-decimal chars
+            elif ch.isascii() and ch.isalnum():
+                digit = int(ch, 36)
+                if digit >= effective:
+                    digit = None
+            else:
+                digit = None
+            if digit is None:
+                if len(text) > _SAFE_EXPR_INT_MAX_PARSE_CHARS:
+                    raise ValueError(
+                        f"safe_expr: int() string too long for a "
+                        f"{_SAFE_EXPR_MAX_INT_BITS}-bit result"
+                    )
+                return  # let int() report the original syntax error
+            digits.append(_SAFE_EXPR_INT_ALPHABET[digit])
+
+        numeral = "".join(digits).lstrip("0") or "0"
+        threshold = _int_width_threshold(effective)
+        if len(numeral) > len(threshold) or (
+            len(numeral) == len(threshold) and numeral >= threshold
+        ):
+            raise ValueError(
+                f"safe_expr: int() result would be wider than "
+                f"{_SAFE_EXPR_MAX_INT_BITS} bits"
+            )
+
+    @staticmethod
     def _same_length_containers(left: typing.Any, right: typing.Any) -> bool:
         return (
             isinstance(left, _SAFE_EXPR_CONTAINER_TYPES)
@@ -807,9 +906,9 @@ class _SafeExprInterpreter:
         if isinstance(node.op, ast.Not):
             return not operand
         if isinstance(node.op, ast.USub):
-            return -operand
+            return self._check_int_result(-operand)
         if isinstance(node.op, ast.UAdd):
-            return +operand
+            return self._check_int_result(+operand)
         raise ValueError(  # pragma: no cover
             f"safe_expr: unsupported unary op {type(node.op).__name__}"
         )
@@ -846,9 +945,7 @@ class _SafeExprInterpreter:
             raise ValueError(f"safe_expr: unsupported binary op {type(op).__name__}")
         # General backstop: no arithmetic step may produce an int wider than the
         # bound, regardless of which operator produced it.
-        if isinstance(result, int) and result.bit_length() > _SAFE_EXPR_MAX_INT_BITS:
-            raise ValueError(f"safe_expr: integer result wider than {_SAFE_EXPR_MAX_INT_BITS} bits")
-        return result
+        return self._check_int_result(result)
 
     def _add(self, left, right):
         if isinstance(left, _SAFE_EXPR_ARITH_SEQUENCE_TYPES) and isinstance(
@@ -945,7 +1042,11 @@ class _SafeExprInterpreter:
             # Every other builtin walks its argument (str, sum, min, max, all, any,
             # int, float); len and bool read only the top level.
             self._check_walkable(*args)
-        return func(*args)
+        if name == "int" and args and isinstance(args[0], (str, bytes)):
+            base = args[1] if len(args) > 1 else 10
+            if type(base) is int and (base == 0 or 2 <= base <= 36):
+                self._int_precheck(args[0], base)
+        return self._check_int_result(func(*args))
 
 
 def _check_safe_expr_size(tree: ast.AST) -> None:

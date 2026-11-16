@@ -16,6 +16,7 @@
 # under the License.
 
 import asyncio
+import sys
 import time
 from typing import AsyncGenerator, Generator, Optional, Tuple, cast
 
@@ -1788,3 +1789,122 @@ class TestTypeEraser:
         from burr.core import type_eraser as te
 
         assert te is type_eraser
+
+
+# --- integer width consistency for builtin calls --------------------------
+
+
+def test_safe_expr_builtin_int_result_width_bounded():
+    cond = Condition.safe_expr("int(s) > 0")
+    assert cond.run(State({"s": "9" * 1233})) == {Condition.KEY: True}
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        cond.run(State({"s": "9" * 1234}))
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        Condition.safe_expr("int('9' * 10000) > 0").run(State({}))
+    assert _eval_value(Condition.safe_expr("int(s)"), {"s": "1" + "0" * 1233}).bit_length() == 4096
+    assert _eval_value(Condition.safe_expr("int(s)"), {"s": "123"}) == 123
+
+
+def test_safe_expr_int_base_zero_prefixes_use_effective_base():
+    cond = Condition.safe_expr("int(s, 0)")
+    assert _eval_value(cond, {"s": "0b" + "1" * 1250}).bit_length() == 1250
+    assert _eval_value(cond, {"s": "0o" + "7" * 1300}).bit_length() == 3900
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        cond.run(State({"s": "0x" + "f" * 1025}))
+    assert _eval_value(cond, {"s": "0X" + "F" * 1024}).bit_length() == 4096
+    assert _eval_value(cond, {"s": " -0b_101 "}) == -5
+    assert _eval_value(cond, {"s": "0x_ff"}) == 255
+    for bad in ("0x__ff", "0b_2", "0123x", "0z1"):
+        with pytest.raises(ValueError) as excinfo:
+            cond.run(State({"s": bad}))
+        assert "wider than 4096 bits" not in str(excinfo.value)
+
+
+def test_safe_expr_int_keeps_python_syntax_errors():
+    cond = Condition.safe_expr("int(s)")
+    for bad in ("9" * 1234 + "__", "1__2", "_123", "123_", "12x", "1_ 2"):
+        with pytest.raises(ValueError) as excinfo:
+            cond.run(State({"s": bad}))
+        assert "wider than 4096 bits" not in str(excinfo.value)
+
+
+def test_safe_expr_int_accepts_legal_syntax():
+    cond = Condition.safe_expr("int(s)")
+    assert _eval_value(cond, {"s": "0" * 4300}) == 0
+    assert _eval_value(cond, {"s": "0" * 4000 + "123"}) == 123
+    assert _eval_value(cond, {"s": "  +0001_234  "}) == 1234
+    assert _eval_value(cond, {"s": "\u0661\u0662\u0663"}) == 123
+    assert _eval_value(cond, {"s": b"  +000123 "}) == 123
+    assert _eval_value(cond, {"s": b"0" * 4300}) == 0
+    base_cond = Condition.safe_expr("int(s, b)")
+    assert _eval_value(base_cond, {"s": "f" * 1024, "b": 16}).bit_length() == 4096
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        base_cond.run(State({"s": "f" * 1025, "b": 16}))
+    assert _eval_value(base_cond, {"s": "1" * 4096, "b": 2}).bit_length() == 4096
+    for bad_base in (1, 37, "16", None):
+        with pytest.raises((ValueError, TypeError)) as excinfo:
+            base_cond.run(State({"s": "10", "b": bad_base}))
+        assert "wider than 4096 bits" not in str(excinfo.value)
+
+
+def test_safe_expr_int_unicode_digits_use_numeric_value():
+    cond = Condition.safe_expr("int(s)")
+    # Arabic-Indic 1 followed by 1233 Arabic-Indic zeroes is exactly 4096 bits.
+    value = "\u0661" + "\u0660" * 1233
+    assert int(value).bit_length() == 4096
+    assert _eval_value(cond, {"s": value}).bit_length() == 4096
+    # One more digit is 4100 bits and is rejected before conversion.
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        cond.run(State({"s": "\u0661" + "\u0660" * 1234}))
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        cond.run(State({"s": "\u0662" + "\u0660" * 1233}))
+
+
+def test_safe_expr_int_invalid_literals_keep_python_error():
+    cond = Condition.safe_expr("int(s)")
+    with pytest.raises(ValueError, match="invalid literal"):
+        cond.run(State({"s": "a" * 1234}))
+    with pytest.raises(ValueError, match="invalid literal"):
+        cond.run(State({"s": "\u00b2" * 1234}))
+    # Documented conservative boundary: unclassifiable text this long is
+    # rejected before int() instead of left to a quadratic conversion.
+    with pytest.raises(ValueError, match="string too long"):
+        cond.run(State({"s": "a" * 10_001}))
+
+
+def test_safe_expr_int_threshold_independent_of_digit_setting():
+    from burr.core.action import _int_width_threshold
+
+    threshold = _int_width_threshold(10)
+    assert len(threshold) == 1234
+    setter = getattr(sys, "set_int_max_str_digits", None)
+    if setter is None:
+        pytest.skip("sys.set_int_max_str_digits unavailable")
+    getter = sys.get_int_max_str_digits
+    original = getter()
+    try:
+        setter(640)
+        assert _int_width_threshold(10) == threshold
+        assert Condition.safe_expr("int(s) > 0").run(State({"s": "42"})) == {Condition.KEY: True}
+        with pytest.raises(ValueError, match="wider than 4096 bits"):
+            Condition.safe_expr("int(s) > 0").run(State({"s": "9" * 1234}))
+    finally:
+        setter(original)
+
+
+def test_safe_expr_unary_and_abs_result_width_bounded():
+    big = 2**4096
+    for expr in ("abs(x)", "-x", "+x"):
+        with pytest.raises(ValueError, match="wider than 4096 bits"):
+            Condition.safe_expr(expr).run(State({"x": -big}))
+    assert _eval_value(Condition.safe_expr("abs(x)"), {"x": -7}) == 7
+
+
+@pytest.mark.parametrize("expr", ["3 ** 2600", "5 ** 1800"])
+def test_safe_expr_pow_upper_bound_not_relaxed(expr):
+    with pytest.raises(ValueError, match="wider than 4096 bits"):
+        Condition.safe_expr(expr)
+
+
+def test_safe_expr_pow_existing_bound_allows_legitimate_expression():
+    assert _eval_value(Condition.safe_expr("10 ** 100"), {}) == 10**100
